@@ -50,15 +50,15 @@ def parse_fasta_id(description):
     - >tr|A0A0H3GKP4|A0A0H3GKP4_HUMAN
     - >P12345
     - >PROTEIN_NAME
-    
+
     Returns the protein ID (tries to get the most specific identifier)
     """
     # Remove '>' if present
     desc = description.lstrip('>')
-    
+
     # Split by pipe
     parts = desc.split('|')
-    
+
     if len(parts) >= 2:
         # For formats like sp|P12345|NAME or prf|Ricin_E|Ricin_E
         # Take the second part (index 1) which is usually the primary ID
@@ -81,16 +81,16 @@ fasta_sequences = SeqIO.parse(open(fasta_lib),'fasta')
 for fasta in fasta_sequences:
         id, name, descri = fasta.id, fasta.name, fasta.description
         sequence = str(fasta.seq)
-        
+
         # Use robust parsing
         diann_prot_id = parse_fasta_id(descri)
-        
+
         protein_id_to_seq[diann_prot_id] = sequence
-        
+
         # Also store the full ID and name as variants (for matching flexibility)
         fasta_id_variants[id] = diann_prot_id
         fasta_id_variants[name] = diann_prot_id
-        
+
         # Store all parts of pipe-separated IDs
         if '|' in descri:
             for part in descri.split('|'):
@@ -108,24 +108,31 @@ def process_row_chunk(row_dicts, protein_id_to_seq, fasta_id_variants):
     """
     expanded_data = []
     not_found_ids = set()
-    
+
     for row_dict in row_dicts:
         stripped_seq = row_dict.get("Stripped.Sequence", "")
         protein_ids_str = row_dict.get("Protein.Ids", "")
-        
+
         if not protein_ids_str or not stripped_seq:
+            # Keep the original row even when it can't be processed
+            new_row = row_dict.copy()
+            new_row["prot_ID"] = None
+            new_row["pept_start"] = None
+            new_row["pept_stop"] = None
+            expanded_data.append(new_row)
             continue
-        
+
         protein_ids = protein_ids_str.split(";")
-        
+        row_matched = False
+
         # Process each protein ID
         for prot_id in protein_ids:
             prot_id = prot_id.strip()
-            
+
             # Strategy 1: Direct lookup
             canonical_id = None
             prot_seq = None
-            
+
             if prot_id in protein_id_to_seq:
                 canonical_id = prot_id
                 prot_seq = protein_id_to_seq[prot_id]
@@ -134,10 +141,10 @@ def process_row_chunk(row_dicts, protein_id_to_seq, fasta_id_variants):
                 canonical_id = fasta_id_variants[prot_id]
                 if canonical_id in protein_id_to_seq:
                     prot_seq = protein_id_to_seq[canonical_id]
-            
+
             if prot_seq is not None:
                 pept_start = prot_seq.find(stripped_seq)
-                
+
                 if pept_start != -1:
                     # Create new row
                     new_row = row_dict.copy()
@@ -145,11 +152,20 @@ def process_row_chunk(row_dicts, protein_id_to_seq, fasta_id_variants):
                     new_row["pept_start"] = pept_start
                     new_row["pept_stop"] = pept_start + len(stripped_seq)
                     expanded_data.append(new_row)
+                    row_matched = True
                 else:
                     not_found_ids.add(prot_id)
             else:
                 not_found_ids.add(prot_id)
-    
+
+        if not row_matched:
+            # No protein ID matched/positioned - keep the original row anyway
+            new_row = row_dict.copy()
+            new_row["prot_ID"] = None
+            new_row["pept_start"] = None
+            new_row["pept_stop"] = None
+            expanded_data.append(new_row)
+
     return expanded_data, not_found_ids
 
 
@@ -163,23 +179,23 @@ if diann_report.endswith(".parquet"):
 
     print("\nDetected .parquet file\n")
     dia_df = pd.read_parquet(diann_report, engine='pyarrow')
-    
+
     print(f"Processing {dia_df.shape[0]} rows in report")
-    
+
     # Convert to list of dictionaries
     row_dicts = dia_df.to_dict('records')
-    
+
     # Split into chunks for parallel processing
     chunk_size = max(1, len(row_dicts) // (n_jobs * 4))  # Create more chunks than cores for better load balancing
     chunks = [row_dicts[i:i + chunk_size] for i in range(0, len(row_dicts), chunk_size)]
-    
+
     print(f"Processing {len(chunks)} chunks in parallel...", file=sys.stderr)
-    
+
     # Process chunks in parallel
-    process_func = partial(process_row_chunk, 
+    process_func = partial(process_row_chunk,
                            protein_id_to_seq=protein_id_to_seq,
                            fasta_id_variants=fasta_id_variants)
-    
+
     with Pool(n_jobs) as pool:
         results = list(tqdm(
             pool.imap(process_func, chunks),
@@ -187,20 +203,20 @@ if diann_report.endswith(".parquet"):
             desc="chunks processed",
             ascii=True
         ))
-    
+
     # Flatten results
     expanded_data = []
     all_not_found = set()
     for chunk_result, not_found_ids in results:
         expanded_data.extend(chunk_result)
         all_not_found.update(not_found_ids)
-    
+
     print(f"Original rows: {dia_df.shape[0]}")
     print(f"Expanded rows: {len(expanded_data)}")
     if all_not_found:
         print(f"Warning: {len(all_not_found)} unique protein IDs not found in FASTA", file=sys.stderr)
         print(f"First 10 missing IDs: {list(all_not_found)[:10]}", file=sys.stderr)
-    
+
     # Create DataFrame once from all data
     dia_df_expanded = pd.DataFrame(expanded_data)
 
@@ -212,27 +228,27 @@ if diann_report.endswith(".parquet"):
 
 elif diann_report.endswith(".tsv"):
     print("\nDetected .tsv file\n")
-    
+
     # For TSV, use pandas for faster processing
     print("Reading TSV file...", file=sys.stderr)
     dia_df = pd.read_csv(diann_report, sep='\t', low_memory=False)
-    
+
     print(f"Processing {dia_df.shape[0]} rows in report")
-    
+
     # Convert to list of dictionaries
     row_dicts = dia_df.to_dict('records')
-    
+
     # Split into chunks for parallel processing
     chunk_size = max(1, len(row_dicts) // (n_jobs * 4))
     chunks = [row_dicts[i:i + chunk_size] for i in range(0, len(row_dicts), chunk_size)]
-    
+
     print(f"Processing {len(chunks)} chunks in parallel...", file=sys.stderr)
-    
+
     # Process chunks in parallel
-    process_func = partial(process_row_chunk, 
+    process_func = partial(process_row_chunk,
                            protein_id_to_seq=protein_id_to_seq,
                            fasta_id_variants=fasta_id_variants)
-    
+
     with Pool(n_jobs) as pool:
         results = list(tqdm(
             pool.imap(process_func, chunks),
@@ -240,23 +256,23 @@ elif diann_report.endswith(".tsv"):
             desc="chunks processed",
             ascii=True
         ))
-    
+
     # Flatten results
     expanded_data = []
     all_not_found = set()
     for chunk_result, not_found_ids in results:
         expanded_data.extend(chunk_result)
         all_not_found.update(not_found_ids)
-    
+
     print(f"Original rows: {dia_df.shape[0]}")
     print(f"Expanded rows: {len(expanded_data)}")
     if all_not_found:
         print(f"Warning: {len(all_not_found)} unique protein IDs not found in FASTA", file=sys.stderr)
         print(f"First 10 missing IDs: {list(all_not_found)[:10]}", file=sys.stderr)
-    
+
     # Create DataFrame and write
     dia_df_expanded = pd.DataFrame(expanded_data)
-    
+
     new_tsv_file_name = diann_file_name.replace(".tsv", ".pos.tsv")
     print("Writing output file...", file=sys.stderr)
     dia_df_expanded.to_csv(new_tsv_file_name, sep='\t', index=False)
