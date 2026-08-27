@@ -1,25 +1,30 @@
-#!/home/momi/mambaforge/bin/python3.10
 ##############################################################################
 ##############################################################################
 #
-#  USAGE: python add_peptide_position_ultra_fast_v2.py DB.fasta diann.report.tsv
+#  USAGE: python add_peptide_position_ultra_fast_v2.py -f DB.fasta -r diann.report.tsv
 #
 #  ULTRA-OPTIMIZED VERSION with ROBUST FASTA ID parsing and parallel processing
+#
+#  LOW-MEMORY MODE: the report is streamed and processed in row batches
+#  (see --batch-size) and the output is written incrementally, so peak
+#  memory no longer scales with the full report size. On a very
+#  memory-constrained machine, use a small --batch-size together with
+#  --jobs 1 (no worker pool at all -> only a single copy of the FASTA
+#  lookup tables in memory).
 #
 ##############################################################################
 ##############################################################################
 
 
 import os
-import codecs
 import sys
 from Bio import SeqIO
+import pyarrow as pa
 import pyarrow.parquet as pq
 import pandas as pd
 from tqdm import tqdm
 import argparse
 from multiprocessing import Pool, cpu_count
-from functools import partial
 
 parser = argparse.ArgumentParser(
         description = "Adding protein position to reported peptides - ULTRA OPTIMIZED")
@@ -30,14 +35,17 @@ parser = argparse.ArgumentParser(
 
 parser.add_argument('-f', "--fasta", help = "Path to fasta-file used as DIANN library", required = True)
 parser.add_argument('-r', "--report", help = "DIANN output report,  report.tsv or report.parquet allowed", required = True)
-parser.add_argument('-j', "--jobs", help = "Number of parallel jobs (default: use all cores)", type=int, default=None)
-
+parser.add_argument('-j', "--jobs", help = "Number of parallel jobs (default: use all cores). Use 1 to disable multiprocessing entirely and keep only a single copy of the FASTA lookup tables in memory.", type=int, default=None)
+parser.add_argument('-b', "--batch-size", dest="batch_size", help = "Number of report rows streamed/processed at a time (default: 200000). Lower this on low-memory machines when processing large (~1GB+) report files.", type=int, default=200000)
 
 args = parser.parse_args()
 
+if args.batch_size < 1:
+    parser.error("--batch-size must be >= 1")
+
 # Determine number of cores
 n_jobs = args.jobs if args.jobs else max(1, cpu_count() - 1)
-print(f"Using {n_jobs} parallel jobs", file=sys.stderr)
+print(f"Using {n_jobs} parallel job(s), batch size {args.batch_size} rows", file=sys.stderr)
 
 fasta_lib = args.fasta
 
@@ -102,10 +110,28 @@ print(f"Loaded {len(protein_id_to_seq)} protein sequences", file=sys.stderr)
 print(f"Created {len(fasta_id_variants)} ID variants for matching", file=sys.stderr)
 
 
-def process_row_chunk(row_dicts, protein_id_to_seq, fasta_id_variants):
+# Populated once per worker process via the Pool initializer (or once in the
+# main process for -j 1) instead of being re-pickled and re-sent for every
+# chunk, which previously multiplied both memory and IPC overhead.
+_protein_id_to_seq = None
+_fasta_id_variants = None
+
+
+def init_worker(protein_dict, variants_dict):
+    global _protein_id_to_seq, _fasta_id_variants
+    _protein_id_to_seq = protein_dict
+    _fasta_id_variants = variants_dict
+
+
+def process_row_chunk(row_dicts):
     """
-    Process a chunk of rows in parallel
+    Process a chunk of rows (in a worker process, or serially in the main
+    process when -j 1 is used). Relies on _protein_id_to_seq /
+    _fasta_id_variants having been set via init_worker().
     """
+    protein_id_to_seq = _protein_id_to_seq
+    fasta_id_variants = _fasta_id_variants
+
     expanded_data = []
     not_found_ids = set()
 
@@ -169,111 +195,133 @@ def process_row_chunk(row_dicts, protein_id_to_seq, fasta_id_variants):
     return expanded_data, not_found_ids
 
 
-# process diann report in either parquet or tsv format
+def process_batch(row_dicts, pool):
+    """
+    Split one in-memory batch of rows into chunks and process them, either
+    across the worker pool or serially in the main process (pool is None).
+    """
+    if pool is not None:
+        chunk_size = max(1, len(row_dicts) // (n_jobs * 4))
+        chunks = [row_dicts[i:i + chunk_size] for i in range(0, len(row_dicts), chunk_size)]
+        results = pool.map(process_row_chunk, chunks)
+    else:
+        results = [process_row_chunk(row_dicts)]
+
+    expanded_data = []
+    not_found_ids = set()
+    for chunk_result, chunk_not_found in results:
+        expanded_data.extend(chunk_result)
+        not_found_ids.update(chunk_not_found)
+
+    return expanded_data, not_found_ids
+
+
+# process diann report in either parquet or tsv format, streaming it in
+# row batches and writing output incrementally so memory use stays bounded
+# by --batch-size rather than by the full report size
 
 diann_report = args.report
 diann_file_name = os.path.split(args.report)[1]
 
+pool = Pool(n_jobs, initializer=init_worker, initargs=(protein_id_to_seq, fasta_id_variants)) if n_jobs > 1 else None
+if pool is None:
+    init_worker(protein_id_to_seq, fasta_id_variants)
 
-if diann_report.endswith(".parquet"):
+total_rows = 0
+total_expanded = 0
+all_not_found = set()
 
-    print("\nDetected .parquet file\n")
-    dia_df = pd.read_parquet(diann_report, engine='pyarrow')
+try:
+    if diann_report.endswith(".parquet"):
 
-    print(f"Processing {dia_df.shape[0]} rows in report")
+        print("\nDetected .parquet file\n")
 
-    # Convert to list of dictionaries
-    row_dicts = dia_df.to_dict('records')
+        parquet_file = pq.ParquetFile(diann_report)
+        source_total_rows = parquet_file.metadata.num_rows
+        n_batches_est = max(1, -(-source_total_rows // args.batch_size))
+        print(f"Report contains {source_total_rows} rows, streaming in batches of {args.batch_size}", file=sys.stderr)
 
-    # Split into chunks for parallel processing
-    chunk_size = max(1, len(row_dicts) // (n_jobs * 4))  # Create more chunks than cores for better load balancing
-    chunks = [row_dicts[i:i + chunk_size] for i in range(0, len(row_dicts), chunk_size)]
+        output_file = diann_file_name.replace(".parquet", ".pos.parquet")
+        writer = None
+        output_schema = None
 
-    print(f"Processing {len(chunks)} chunks in parallel...", file=sys.stderr)
+        for batch in tqdm(parquet_file.iter_batches(batch_size=args.batch_size),
+                           total=n_batches_est, desc="batches processed", ascii=True):
+            batch_df = batch.to_pandas()
+            total_rows += batch_df.shape[0]
+            row_dicts = batch_df.to_dict('records')
+            del batch_df
 
-    # Process chunks in parallel
-    process_func = partial(process_row_chunk,
-                           protein_id_to_seq=protein_id_to_seq,
-                           fasta_id_variants=fasta_id_variants)
+            expanded_data, not_found_ids = process_batch(row_dicts, pool)
+            all_not_found.update(not_found_ids)
+            del row_dicts
 
-    with Pool(n_jobs) as pool:
-        results = list(tqdm(
-            pool.imap(process_func, chunks),
-            total=len(chunks),
-            desc="chunks processed",
-            ascii=True
-        ))
+            out_df = pd.DataFrame(expanded_data)
+            del expanded_data
+            out_df["prot_ID"] = out_df["prot_ID"].astype("string")
+            out_df["pept_start"] = out_df["pept_start"].astype("Int64")
+            out_df["pept_stop"] = out_df["pept_stop"].astype("Int64")
 
-    # Flatten results
-    expanded_data = []
-    all_not_found = set()
-    for chunk_result, not_found_ids in results:
-        expanded_data.extend(chunk_result)
-        all_not_found.update(not_found_ids)
+            table = pa.Table.from_pandas(out_df, preserve_index=False)
+            del out_df
 
-    print(f"Original rows: {dia_df.shape[0]}")
-    print(f"Expanded rows: {len(expanded_data)}")
-    if all_not_found:
-        print(f"Warning: {len(all_not_found)} unique protein IDs not found in FASTA", file=sys.stderr)
-        print(f"First 10 missing IDs: {list(all_not_found)[:10]}", file=sys.stderr)
+            if writer is None:
+                output_schema = table.schema
+                writer = pq.ParquetWriter(output_file, output_schema)
+            else:
+                table = table.cast(output_schema)
 
-    # Create DataFrame once from all data
-    dia_df_expanded = pd.DataFrame(expanded_data)
+            writer.write_table(table)
+            total_expanded += table.num_rows
+            del table
 
-    #write pandas df back to parquet
-    output_file = diann_file_name.replace(".parquet", ".pos.parquet")
-    dia_df_expanded.to_parquet(output_file, index=False)
-    print("Output written to:", output_file)
+        if writer is not None:
+            writer.close()
 
+        print(f"Original rows: {total_rows}")
+        print(f"Expanded rows: {total_expanded}")
+        if all_not_found:
+            print(f"Warning: {len(all_not_found)} unique protein IDs not found in FASTA", file=sys.stderr)
+            print(f"First 10 missing IDs: {list(all_not_found)[:10]}", file=sys.stderr)
+        print("Output written to:", output_file)
 
-elif diann_report.endswith(".tsv"):
-    print("\nDetected .tsv file\n")
+    elif diann_report.endswith(".tsv"):
 
-    # For TSV, use pandas for faster processing
-    print("Reading TSV file...", file=sys.stderr)
-    dia_df = pd.read_csv(diann_report, sep='\t', low_memory=False)
+        print("\nDetected .tsv file\n")
+        print(f"Streaming TSV file in batches of {args.batch_size} rows...", file=sys.stderr)
 
-    print(f"Processing {dia_df.shape[0]} rows in report")
+        new_tsv_file_name = diann_file_name.replace(".tsv", ".pos.tsv")
+        first_batch = True
 
-    # Convert to list of dictionaries
-    row_dicts = dia_df.to_dict('records')
+        reader = pd.read_csv(diann_report, sep='\t', low_memory=False, chunksize=args.batch_size)
+        for batch_df in tqdm(reader, desc="batches processed", ascii=True):
+            total_rows += batch_df.shape[0]
+            row_dicts = batch_df.to_dict('records')
+            del batch_df
 
-    # Split into chunks for parallel processing
-    chunk_size = max(1, len(row_dicts) // (n_jobs * 4))
-    chunks = [row_dicts[i:i + chunk_size] for i in range(0, len(row_dicts), chunk_size)]
+            expanded_data, not_found_ids = process_batch(row_dicts, pool)
+            all_not_found.update(not_found_ids)
+            del row_dicts
 
-    print(f"Processing {len(chunks)} chunks in parallel...", file=sys.stderr)
+            out_df = pd.DataFrame(expanded_data)
+            del expanded_data
+            out_df.to_csv(new_tsv_file_name, sep='\t', index=False,
+                           mode='w' if first_batch else 'a', header=first_batch)
+            total_expanded += out_df.shape[0]
+            del out_df
+            first_batch = False
 
-    # Process chunks in parallel
-    process_func = partial(process_row_chunk,
-                           protein_id_to_seq=protein_id_to_seq,
-                           fasta_id_variants=fasta_id_variants)
+        print(f"Original rows: {total_rows}")
+        print(f"Expanded rows: {total_expanded}")
+        if all_not_found:
+            print(f"Warning: {len(all_not_found)} unique protein IDs not found in FASTA", file=sys.stderr)
+            print(f"First 10 missing IDs: {list(all_not_found)[:10]}", file=sys.stderr)
+        print("Output written to:", new_tsv_file_name)
 
-    with Pool(n_jobs) as pool:
-        results = list(tqdm(
-            pool.imap(process_func, chunks),
-            total=len(chunks),
-            desc="chunks processed",
-            ascii=True
-        ))
+    else:
+        parser.error("--report must end with .tsv or .parquet")
 
-    # Flatten results
-    expanded_data = []
-    all_not_found = set()
-    for chunk_result, not_found_ids in results:
-        expanded_data.extend(chunk_result)
-        all_not_found.update(not_found_ids)
-
-    print(f"Original rows: {dia_df.shape[0]}")
-    print(f"Expanded rows: {len(expanded_data)}")
-    if all_not_found:
-        print(f"Warning: {len(all_not_found)} unique protein IDs not found in FASTA", file=sys.stderr)
-        print(f"First 10 missing IDs: {list(all_not_found)[:10]}", file=sys.stderr)
-
-    # Create DataFrame and write
-    dia_df_expanded = pd.DataFrame(expanded_data)
-
-    new_tsv_file_name = diann_file_name.replace(".tsv", ".pos.tsv")
-    print("Writing output file...", file=sys.stderr)
-    dia_df_expanded.to_csv(new_tsv_file_name, sep='\t', index=False)
-    print("Output written to:", new_tsv_file_name)
+finally:
+    if pool is not None:
+        pool.close()
+        pool.join()

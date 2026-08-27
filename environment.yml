@@ -1,0 +1,10 @@
+name: add_peptide_position
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.10
+  - biopython
+  - pyarrow
+  - pandas
+  - tqdm

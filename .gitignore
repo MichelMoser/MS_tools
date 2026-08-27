@@ -1,0 +1,4 @@
+# Raw/derived data files - not source code, kept local only
+*.fasta
+*.parquet
+*.pos.tsv
